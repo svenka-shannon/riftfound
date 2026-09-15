@@ -559,7 +559,10 @@ export async function setLastStaleCleanupTimeDynamoDB(timestamp: string): Promis
 }
 
 // Remove upcoming events that no longer appear in the upstream API
-export async function cleanupStaleEventsDynamoDB(seenExternalIds: Set<string>): Promise<number> {
+export async function cleanupStaleEventsDynamoDB(
+  seenExternalIds: Set<string>,
+  protectedExternalIdPrefixes: string[] = []
+): Promise<number> {
   const client = getDynamoClient();
   const tableName = getTableName();
   const today = new Date().toISOString();
@@ -582,9 +585,12 @@ export async function cleanupStaleEventsDynamoDB(seenExternalIds: Set<string>): 
     }));
 
     if (response.Items) {
-      const staleItems = response.Items.filter(
-        item => !seenExternalIds.has(item.externalId as string)
-      );
+      const staleItems = response.Items.filter(item => {
+        const externalId = item.externalId as string;
+        if (seenExternalIds.has(externalId)) return false;
+        // Never delete events from a source that did not run this cycle
+        return !protectedExternalIdPrefixes.some(prefix => externalId.startsWith(prefix));
+      });
 
       // Delete in batches of 25
       for (let i = 0; i < staleItems.length; i += 25) {

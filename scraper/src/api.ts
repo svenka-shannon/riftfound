@@ -51,7 +51,11 @@ function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-function formatPrice(cents: number, currency: string): string {
+/**
+ * Format a price for display. Shared with the playriftbound source so both
+ * sources produce identical price strings ('Free', '$15.00').
+ */
+export function formatPrice(cents: number, currency: string): string {
   if (cents === 0) return 'Free';
   const dollars = cents / 100;
   const symbol = currency === 'USD' ? '$' : currency === 'EUR' ? '€' : currency === 'GBP' ? '£' : '';

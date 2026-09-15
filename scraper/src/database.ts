@@ -699,10 +699,20 @@ export async function shouldRunStaleCleanup(): Promise<boolean> {
 }
 
 // Remove upcoming events that no longer appear in the upstream API
-export async function cleanupStaleEvents(seenExternalIds: Set<string>): Promise<number> {
+/**
+ * Remove upcoming events that no longer appear in any source.
+ *
+ * `protectedExternalIdPrefixes` shields events belonging to a source that did not
+ * run this cycle (disabled or failed), so a temporary source outage cannot delete
+ * that source's events.
+ */
+export async function cleanupStaleEvents(
+  seenExternalIds: Set<string>,
+  protectedExternalIdPrefixes: string[] = []
+): Promise<number> {
   if (!useDynamoDB()) return 0;
 
-  const deleted = await cleanupStaleEventsDynamoDB(seenExternalIds);
+  const deleted = await cleanupStaleEventsDynamoDB(seenExternalIds, protectedExternalIdPrefixes);
   await setLastStaleCleanupTimeDynamoDB(new Date().toISOString());
   return deleted;
 }

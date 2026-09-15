@@ -23,6 +23,9 @@ import {
   UpsertShopResult,
 } from './database.js';
 import { fetchEventsPage, fetchEventTemplates, getEventCount } from './api.js';
+import { fetchPlayriftboundEvents, PLAYRIFTBOUND_ID_PREFIX } from './sources/playriftbound.js';
+import { eventDedupeKey, splitDuplicates } from './dedupe.js';
+import { env } from './config.js';
 import { reverseGeocodeCity } from './geocoding.js';
 
 const cloudwatch = new CloudWatchClient({});
@@ -76,6 +79,14 @@ export async function handler(
   const eventIdsSeen = new Set<string>();
   const shopsToGeocode: UpsertShopResult[] = [];
 
+  // Second source (playriftbound) state - see runDistributedScrape in index.ts
+  const uvsDedupeKeys = new Set<string>();
+  const uvsCoordinates: { latitude?: number | null; longitude?: number | null }[] = [];
+  let prbFound = 0;
+  let prbDeduped = 0;
+  let prbAnchorsQueried = 0;
+  let prbAnchorsAvailable = 0;
+
   try {
     // Fetch event configuration templates for category mapping
     await fetchEventTemplates();
@@ -114,6 +125,8 @@ export async function handler(
       // Process events from this page
       for (const event of events) {
         eventIdsSeen.add(event.externalId);
+        uvsDedupeKeys.add(eventDedupeKey(event));
+        uvsCoordinates.push({ latitude: event.latitude, longitude: event.longitude });
         const result = await upsertEventWithStore(event, event.storeInfo);
         if (result.created) {
           totalCreated++;
@@ -145,6 +158,57 @@ export async function handler(
 
       // Small delay to be respectful to upstream API (2 seconds)
       await new Promise(resolve => setTimeout(resolve, 2000));
+    }
+
+    // Second source: Riot's playriftbound API. Rate limited, so it only runs
+    // with whatever time is left after the UVS burst and stops at its deadline -
+    // unswept anchors roll over to the next invocation.
+    const PRB_RESERVED_MS = 120000; // leave time for geocoding + cleanup + metrics
+    if (env.PLAYRIFTBOUND_ENABLED && context.getRemainingTimeInMillis() > PRB_RESERVED_MS + 30000) {
+      console.log('Running playriftbound source...');
+      const prbResult = await fetchPlayriftboundEvents({
+        requestDelayMs: env.PLAYRIFTBOUND_REQUEST_DELAY_MS,
+        maxAnchorsPerRun: env.PLAYRIFTBOUND_MAX_ANCHORS_PER_RUN,
+        queryHash: env.PLAYRIFTBOUND_QUERY_HASH,
+        coordinates: uvsCoordinates,
+        deadline: Date.now() + context.getRemainingTimeInMillis() - PRB_RESERVED_MS,
+      });
+
+      prbAnchorsQueried = prbResult.anchorsQueried;
+      prbAnchorsAvailable = prbResult.anchorsAvailable;
+
+      const { unique: prbUnique, duplicates } = splitDuplicates(prbResult.events, uvsDedupeKeys);
+      prbDeduped = duplicates.length;
+
+      for (const event of prbUnique) {
+        prbFound++;
+        totalFound++;
+        eventIdsSeen.add(event.externalId);
+        const result = await upsertEventWithStore(event, event.storeInfo);
+        if (result.created) {
+          totalCreated++;
+        } else if (result.skipped) {
+          totalSkipped++;
+        } else {
+          totalUpdated++;
+        }
+
+        if (event.storeInfo && !storesSeen.has(event.storeInfo.name)) {
+          storesSeen.add(event.storeInfo.name);
+          totalStores++;
+
+          if (result.shopResult?.needsCityGeocode) {
+            shopsToGeocode.push(result.shopResult);
+          }
+        }
+      }
+
+      console.log(
+        `playriftbound: ${prbFound} events upserted, ${prbDeduped} duplicates of UVS events skipped, ` +
+          `${prbAnchorsQueried}/${prbAnchorsAvailable} anchors swept`
+      );
+    } else if (env.PLAYRIFTBOUND_ENABLED) {
+      console.warn('Skipping playriftbound source - not enough Lambda time remaining');
     }
 
     // Process shops that need city geocoding (if we have time)
@@ -186,7 +250,9 @@ export async function handler(
       const shouldCleanup = await shouldRunStaleCleanup();
       if (shouldCleanup) {
         console.log(`Running stale event cleanup (${eventIdsSeen.size} events seen in API)...`);
-        staleCount = await cleanupStaleEvents(eventIdsSeen);
+        // playriftbound anchors are swept in rotating batches, so its events are
+        // expected to be missing from a single run's seen set - never stale.
+        staleCount = await cleanupStaleEvents(eventIdsSeen, [PLAYRIFTBOUND_ID_PREFIX]);
         if (staleCount > 0) {
           console.log(`Removed ${staleCount} stale events no longer in API`);
         } else {
@@ -205,6 +271,9 @@ export async function handler(
       skipped: totalSkipped,
       skipRate: `${skipRate}%`,
       stores: totalStores,
+      playriftboundFound: prbFound,
+      playriftboundDeduped: prbDeduped,
+      playriftboundAnchors: `${prbAnchorsQueried}/${prbAnchorsAvailable}`,
       citiesGeocoded: totalCitiesGeocoded,
       pagesProcessed: currentPage,
       deleted: deletedCount,

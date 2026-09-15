@@ -13,6 +13,8 @@ import {
   clearPhotonQueue,
 } from './database.js';
 import { fetchEventsPage, fetchEventTemplates, getEventCount } from './api.js';
+import { fetchPlayriftboundEvents, PLAYRIFTBOUND_ID_PREFIX } from './sources/playriftbound.js';
+import { eventDedupeKey, splitDuplicates } from './dedupe.js';
 import { env } from './config.js';
 import { reverseGeocodeCity } from './geocoding.js';
 import { execSync } from 'child_process';
@@ -119,6 +121,28 @@ async function runDistributedScrape(): Promise<{ found: number; created: number 
   const eventIdsSeen = new Set<string>();
   let currentPage = 1;
 
+  // Per-source stats (uvs = UVS Games API, prb = Riot's playriftbound API)
+  let uvsFound = 0;
+  let prbFound = 0;
+  let prbCreated = 0;
+  let prbUpdated = 0;
+  let prbSkipped = 0;
+  let prbDeduped = 0;
+  let prbAnchorsQueried = 0;
+  let prbAnchorsAvailable = 0;
+
+  // Coordinates of every UVS event this cycle. The playriftbound API only
+  // searches around a coordinate (with a hard ~161km radius cap), so these seed
+  // its anchor set - coverage then follows wherever Riftbound is actually played.
+  const uvsCoordinates: { latitude?: number | null; longitude?: number | null }[] = [];
+
+  // Location+time keys of every UVS event seen this cycle. Used to drop
+  // playriftbound events the UVS source already covered. Deliberately only
+  // populated from the UVS pass: a single store legitimately runs two different
+  // tournaments at the same minute, so playriftbound events are never deduped
+  // against each other (they are already unique by tournament id).
+  const uvsDedupeKeys = new Set<string>();
+
   // Queue of shops that need city geocoding
   const shopsToGeocode: UpsertShopResult[] = [];
 
@@ -138,6 +162,8 @@ async function runDistributedScrape(): Promise<{ found: number; created: number 
 
       for (const event of events) {
         eventIdsSeen.add(event.externalId);
+        uvsDedupeKeys.add(eventDedupeKey(event));
+        uvsCoordinates.push({ latitude: event.latitude, longitude: event.longitude });
         const result = await upsertEventWithStore(event, event.storeInfo);
         if (result.created) {
           pageCreated++;
@@ -179,6 +205,61 @@ async function runDistributedScrape(): Promise<{ found: number; created: number 
       await sleep(waitTime);
     }
 
+    uvsFound = totalFound;
+
+    // Second source: Riot's official playriftbound API.
+    // Anchor-based sweep, merged into the same tables, de-duplicated against the
+    // UVS pass above. Failures here are non-fatal - the UVS run still counts.
+    if (env.PLAYRIFTBOUND_ENABLED) {
+      console.log(`\n=== playriftbound source ===`);
+      const prbResult = await fetchPlayriftboundEvents({
+        requestDelayMs: env.PLAYRIFTBOUND_REQUEST_DELAY_MS,
+        maxAnchorsPerRun: env.PLAYRIFTBOUND_MAX_ANCHORS_PER_RUN,
+        queryHash: env.PLAYRIFTBOUND_QUERY_HASH,
+        coordinates: uvsCoordinates,
+      });
+
+      prbAnchorsQueried = prbResult.anchorsQueried;
+      prbAnchorsAvailable = prbResult.anchorsAvailable;
+
+      const { unique: prbUnique, duplicates: prbDuplicates } = splitDuplicates(prbResult.events, uvsDedupeKeys);
+      prbDeduped = prbDuplicates.length;
+
+      for (const event of prbUnique) {
+        prbFound++;
+        eventIdsSeen.add(event.externalId);
+        const result = await upsertEventWithStore(event, event.storeInfo);
+        if (result.created) {
+          prbCreated++;
+        } else if (result.skipped) {
+          prbSkipped++;
+        } else {
+          prbUpdated++;
+        }
+
+        if (event.storeInfo && !storesSeen.has(event.storeInfo.name)) {
+          storesSeen.add(event.storeInfo.name);
+          totalStores++;
+
+          if (result.shopResult?.needsCityGeocode) {
+            shopsToGeocode.push(result.shopResult);
+          }
+        }
+      }
+
+      totalFound += prbFound;
+      totalCreated += prbCreated;
+      totalUpdated += prbUpdated;
+      totalSkipped += prbSkipped;
+
+      console.log(
+        `[playriftbound] ${prbFound} events upserted (${prbCreated} new, ${prbUpdated} updated` +
+          `${prbSkipped > 0 ? `, ${prbSkipped} unchanged` : ''}), ${prbDeduped} duplicates of UVS events skipped`
+      );
+    } else {
+      console.log('\nplayriftbound source disabled (PLAYRIFTBOUND_ENABLED=false)');
+    }
+
     // Process shops that need city geocoding
     if (shopsToGeocode.length > 0) {
       console.log(`\nGeocoding cities for ${shopsToGeocode.length} shops...`);
@@ -210,8 +291,11 @@ async function runDistributedScrape(): Promise<{ found: number; created: number 
     if (eventIdsSeen.size > 0) {
       const shouldCleanup = await shouldRunStaleCleanup();
       if (shouldCleanup) {
+        // playriftbound anchors are swept in rotating batches, so a playriftbound
+        // event missing from this cycle's seen set is expected, not stale. Those
+        // events are protected here and aged out by deleteOldEvents instead.
         console.log(`\nRunning stale event cleanup (${eventIdsSeen.size} events seen in API)...`);
-        staleCount = await cleanupStaleEvents(eventIdsSeen);
+        staleCount = await cleanupStaleEvents(eventIdsSeen, [PLAYRIFTBOUND_ID_PREFIX]);
         if (staleCount > 0) {
           console.log(`Removed ${staleCount} stale events no longer in API`);
         } else {
@@ -228,6 +312,11 @@ async function runDistributedScrape(): Promise<{ found: number; created: number 
     if (totalSkipped > 0) {
       const skipRate = Math.round((totalSkipped / totalFound) * 100);
       console.log(`  Events unchanged (writes skipped): ${totalSkipped} (${skipRate}%)`);
+    }
+    console.log(`  By source: UVS ${uvsFound}, playriftbound ${prbFound}` +
+      `${prbDeduped > 0 ? ` (+${prbDeduped} deduped against UVS)` : ''}`);
+    if (prbAnchorsAvailable > 0) {
+      console.log(`  playriftbound anchors swept: ${prbAnchorsQueried}/${prbAnchorsAvailable}`);
     }
     console.log(`  Unique stores: ${totalStores}`);
     if (totalCitiesGeocoded > 0) {
