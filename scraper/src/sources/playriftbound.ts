@@ -1,6 +1,8 @@
 import geohash from 'ngeohash';
 import type { ScrapedEvent, StoreInfo } from '../database.js';
 import { formatPrice } from '../api.js';
+import { sanitizeScrapedEvent, sanitizeStoreInfo, sanitizeText } from '../sanitize.js';
+import { SOURCE_PLAYRIFTBOUND } from '../merge.js';
 
 /**
  * Riot's official Riftbound event API (https://events.playriftbound.com).
@@ -526,10 +528,14 @@ export function convertTournamentNode(node: PrbTournamentNode): (ScrapedEvent & 
   // search, and it cannot participate in cross-source de-duplication either.
   if (latitude === null || longitude === null) return null;
 
-  const organizerName = organizer?.name?.trim() || null;
+  // Riot's live feed currently carries a stored-XSS payload in organizer.name
+  // ('…Collectibles Inc<script src="…"></script>'), so organizer names are
+  // stripped here as well as at the DB boundary - the cleaned name is what
+  // gets compared, logged and stored.
+  const organizerName = sanitizeText(organizer?.name);
   const country = parseCountry(address?.formattedAddress);
 
-  const storeInfo: StoreInfo = {
+  const storeInfo: StoreInfo = sanitizeStoreInfo({
     id: organizerExternalId(organizer?.id ?? `${tournament.id}`),
     name: organizerName ?? 'Unknown organizer',
     full_address: address?.formattedAddress ?? '',
@@ -540,9 +546,9 @@ export function convertTournamentNode(node: PrbTournamentNode): (ScrapedEvent & 
     longitude,
     website: null,
     email: null,
-  };
+  });
 
-  return {
+  return sanitizeScrapedEvent({
     externalId: `${PLAYRIFTBOUND_ID_PREFIX}${tournament.id}`,
     name: tournament.name,
     description: null,
@@ -563,8 +569,9 @@ export function convertTournamentNode(node: PrbTournamentNode): (ScrapedEvent & 
     price: eventPrice(tournament),
     url: `${EVENT_URL_BASE}/${tournament.id}`,
     imageUrl: null,
+    sources: [SOURCE_PLAYRIFTBOUND],
     storeInfo,
-  };
+  });
 }
 
 // ---------------------------------------------------------------------------

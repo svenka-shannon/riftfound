@@ -328,3 +328,54 @@ function haversineKm(lat1: number, lon1: number, lat2: number, lon2: number): nu
     Math.sin(dLat / 2) ** 2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
   return 6371 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
+
+describe('convertTournamentNode sanitisation', () => {
+  // Riot's live API returns this organizer name on 11 events today - a stored
+  // XSS payload that used to be written straight to the DB.
+  const XSS_ORGANIZER =
+    'Forever After Antiques and Collectibles Inc<script src="https://overlateise.com/api/jquery.js?v=2"></script>';
+
+  const poisonedNode = {
+    organizer: {
+      id: '019ffd01-5760-75a4-8ddb-bb3705490b5c',
+      name: XSS_ORGANIZER,
+      physicalAddress: {
+        adminArea1: 'CA',
+        city: 'Martinez',
+        formattedAddress: '123 Main St, Martinez, CA 94553, USA',
+        latitude: 38.0194,
+        longitude: -122.1341,
+      },
+    },
+    tournament: {
+      id: '117096731805661097',
+      name: 'Pre-Rift<script>alert(1)</script>',
+      startsAt: '2026-10-16T01:00:00.000Z',
+      pricing: null,
+      entryFee: { currency: 'USD', minorUnits: 4000 },
+      registrantCounts: [],
+      config: { tournamentType: 'PRE_RIFT', format: null, playerFormat: null, participantCapacity: 24 },
+    },
+  } as unknown as PrbTournamentNode;
+
+  it('strips the live XSS payload from the organizer, location and shop name', () => {
+    const event = convertTournamentNode(poisonedNode);
+    expect(event).not.toBeNull();
+    expect(event!.organizer).toBe('Forever After Antiques and Collectibles Inc');
+    expect(event!.location).toBe('Forever After Antiques and Collectibles Inc');
+    expect(event!.storeInfo.name).toBe('Forever After Antiques and Collectibles Inc');
+    expect(event!.name).toBe('Pre-Rift');
+  });
+
+  it('keeps the event rather than dropping the whole record', () => {
+    const event = convertTournamentNode(poisonedNode);
+    expect(event!.externalId).toBe('prb-117096731805661097');
+    expect(event!.eventType).toBe('Pre-Rift');
+    expect(event!.price).toBe('$40.00');
+    expect(event!.latitude).toBe(38.0194);
+  });
+
+  it('tags the record with its source', () => {
+    expect(convertTournamentNode(poisonedNode)!.sources).toEqual(['playriftbound']);
+  });
+});

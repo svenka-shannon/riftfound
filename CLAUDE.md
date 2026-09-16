@@ -41,8 +41,11 @@ riftfound/
 - **Distance filtering**: Haversine formula. Frontend uses miles, backend uses km internally.
 - **Two event sources**: UVS Games (one global query, paginated) plus Riot's playriftbound API
   (persisted GraphQL query; it clamps its distance filter to ~161km, so it is swept from many
-  anchor coordinates seeded by the UVS pass, in rotating batches). Merged with a location+time
-  de-duplication key.
+  anchor coordinates seeded by the UVS pass, in rotating batches). Matched on a location+time
+  de-duplication key, guarded by a price+category check, then **field-merged** so Riot's
+  authoritative event type and registration URL land on the incumbent UVS row.
+- **Sanitisation**: every free-text field from either source is stripped of HTML before it
+  reaches the database (`scraper/src/sanitize.ts`).
 
 ## Default Behavior
 

@@ -22,9 +22,10 @@ import {
   cleanupStaleEvents,
   UpsertShopResult,
 } from './database.js';
-import { fetchEventsPage, fetchEventTemplates, getEventCount } from './api.js';
+import { fetchEventsPage, fetchEventTemplates, getEventCount, type UvsEvent } from './api.js';
 import { fetchPlayriftboundEvents, PLAYRIFTBOUND_ID_PREFIX } from './sources/playriftbound.js';
-import { eventDedupeKey, splitDuplicates } from './dedupe.js';
+import { addToDedupeIndex, markEventSeen, splitDuplicates, type DedupeIndex } from './dedupe.js';
+import { mergeEventRecords } from './merge.js';
 import { env } from './config.js';
 import { reverseGeocodeCity } from './geocoding.js';
 
@@ -73,6 +74,7 @@ export async function handler(
   let totalCreated = 0;
   let totalUpdated = 0;
   let totalSkipped = 0;  // Events unchanged, write skipped (DynamoDB cost savings)
+  let totalDuplicateIds = 0;  // Same event id returned twice by the API's unstable paging
   let totalStores = 0;
   let totalCitiesGeocoded = 0;
   const storesSeen = new Set<string>();
@@ -80,10 +82,12 @@ export async function handler(
   const shopsToGeocode: UpsertShopResult[] = [];
 
   // Second source (playriftbound) state - see runDistributedScrape in index.ts
-  const uvsDedupeKeys = new Set<string>();
+  const uvsIndex: DedupeIndex<UvsEvent> = new Map();
   const uvsCoordinates: { latitude?: number | null; longitude?: number | null }[] = [];
   let prbFound = 0;
-  let prbDeduped = 0;
+  let prbMerged = 0;
+  let prbMergeWritten = 0;
+  let prbMergeSkipped = 0;
   let prbAnchorsQueried = 0;
   let prbAnchorsAvailable = 0;
 
@@ -120,12 +124,18 @@ export async function handler(
       console.log(`Fetching page ${currentPage}/${pageCount}...`);
       const { events, hasMore } = await fetchEventsPage(currentPage);
 
-      totalFound += events.length;
-
       // Process events from this page
       for (const event of events) {
-        eventIdsSeen.add(event.externalId);
-        uvsDedupeKeys.add(eventDedupeKey(event));
+        // Offset pagination is unstable upstream, so the same event id shows up
+        // on more than one page within a run (~1.5% of rows). Skip the repeats
+        // instead of upserting them twice.
+        if (!markEventSeen(eventIdsSeen, event.externalId)) {
+          totalDuplicateIds++;
+          continue;
+        }
+
+        totalFound++;
+        addToDedupeIndex(uvsIndex, event);
         uvsCoordinates.push({ latitude: event.latitude, longitude: event.longitude });
         const result = await upsertEventWithStore(event, event.storeInfo);
         if (result.created) {
@@ -177,13 +187,29 @@ export async function handler(
       prbAnchorsQueried = prbResult.anchorsQueried;
       prbAnchorsAvailable = prbResult.anchorsAvailable;
 
-      const { unique: prbUnique, duplicates } = splitDuplicates(prbResult.events, uvsDedupeKeys);
-      prbDeduped = duplicates.length;
+      const { unique: prbUnique, matched: prbMatched } = splitDuplicates(prbResult.events, uvsIndex);
+      prbMerged = prbMatched.length;
+
+      // Matched pairs are field-merged onto the incumbent UVS record and
+      // re-upserted under the UVS externalId (no duplicate row) instead of the
+      // Riot record being discarded. See merge.ts for the field policy.
+      for (const { secondary, primary } of prbMatched) {
+        const merged = mergeEventRecords(primary, secondary);
+        const mergeResult = await upsertEventWithStore(merged, merged.storeInfo);
+        if (mergeResult.skipped) {
+          prbMergeSkipped++;
+        } else {
+          prbMergeWritten++;
+        }
+      }
 
       for (const event of prbUnique) {
+        if (!markEventSeen(eventIdsSeen, event.externalId)) {
+          totalDuplicateIds++;
+          continue;
+        }
         prbFound++;
         totalFound++;
-        eventIdsSeen.add(event.externalId);
         const result = await upsertEventWithStore(event, event.storeInfo);
         if (result.created) {
           totalCreated++;
@@ -204,7 +230,8 @@ export async function handler(
       }
 
       console.log(
-        `playriftbound: ${prbFound} events upserted, ${prbDeduped} duplicates of UVS events skipped, ` +
+        `playriftbound: ${prbFound} events upserted, ${prbMerged} field-merged into matching UVS events ` +
+          `(${prbMergeWritten} rewritten, ${prbMergeSkipped} already up to date), ` +
           `${prbAnchorsQueried}/${prbAnchorsAvailable} anchors swept`
       );
     } else if (env.PLAYRIFTBOUND_ENABLED) {
@@ -271,8 +298,9 @@ export async function handler(
       skipped: totalSkipped,
       skipRate: `${skipRate}%`,
       stores: totalStores,
+      duplicateIdsSkipped: totalDuplicateIds,
       playriftboundFound: prbFound,
-      playriftboundDeduped: prbDeduped,
+      playriftboundMerged: prbMerged,
       playriftboundAnchors: `${prbAnchorsQueried}/${prbAnchorsAvailable}`,
       citiesGeocoded: totalCitiesGeocoded,
       pagesProcessed: currentPage,

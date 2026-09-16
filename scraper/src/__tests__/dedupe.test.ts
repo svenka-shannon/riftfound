@@ -1,5 +1,15 @@
 import { describe, it, expect } from 'vitest';
-import { dedupeKeyCandidates, eventDedupeKey, splitDuplicates } from '../dedupe.js';
+import {
+  addToDedupeIndex,
+  buildDedupeIndex,
+  dedupeKeyCandidates,
+  eventDedupeKey,
+  findDuplicate,
+  looksLikeDifferentEvent,
+  markEventSeen,
+  splitDuplicates,
+  type DedupeableEvent,
+} from '../dedupe.js';
 
 describe('eventDedupeKey', () => {
   it('builds a lat|lon|minute key', () => {
@@ -72,17 +82,19 @@ describe('splitDuplicates', () => {
   const riotSameEvent = { id: 'a', latitude: 37.0203, longitude: -121.5605, startDate: new Date('2026-10-02T00:00:00Z') };
   const riotOtherEvent = { id: 'b', latitude: 40.7128, longitude: -74.006, startDate: new Date('2026-10-05T23:00:00Z') };
 
-  it('drops second-source events the first source already reported', () => {
-    const keys = new Set([eventDedupeKey(uvsEvent)]);
-    const { unique, duplicates } = splitDuplicates([riotSameEvent, riotOtherEvent], keys);
+  it('pairs second-source events with the first-source event they duplicate', () => {
+    const index = buildDedupeIndex([uvsEvent]);
+    const { unique, matched } = splitDuplicates([riotSameEvent, riotOtherEvent], index);
     expect(unique.map(e => e.id)).toEqual(['b']);
-    expect(duplicates.map(e => e.id)).toEqual(['a']);
+    expect(matched.map(m => m.secondary.id)).toEqual(['a']);
+    // The pair carries the primary record, so the two can be field-merged.
+    expect(matched[0].primary).toBe(uvsEvent);
   });
 
   it('keeps everything when the first source found nothing there', () => {
-    const { unique, duplicates } = splitDuplicates([riotSameEvent, riotOtherEvent], new Set<string>());
+    const { unique, matched } = splitDuplicates([riotSameEvent, riotOtherEvent], buildDedupeIndex<DedupeableEvent>([]));
     expect(unique).toHaveLength(2);
-    expect(duplicates).toHaveLength(0);
+    expect(matched).toHaveLength(0);
   });
 
   it('keeps two different tournaments at the same store and minute', () => {
@@ -92,9 +104,9 @@ describe('splitDuplicates', () => {
     const second = { id: 'prb-117124556273536574', latitude: 37.9419, longitude: -121.7367, startDate: new Date('2026-10-19T01:00:00Z') };
     expect(eventDedupeKey(first)).toBe(eventDedupeKey(second));
 
-    const { unique, duplicates } = splitDuplicates([first, second], new Set<string>());
+    const { unique, matched } = splitDuplicates([first, second], buildDedupeIndex<DedupeableEvent>([]));
     expect(unique).toHaveLength(2);
-    expect(duplicates).toHaveLength(0);
+    expect(matched).toHaveLength(0);
   });
 });
 
@@ -128,15 +140,172 @@ describe('dedupeKeyCandidates', () => {
     const riot = { latitude: 37.02051, longitude: -121.56051, startDate: new Date('2026-10-02T01:00:00Z') };
     expect(eventDedupeKey(riot)).not.toBe(eventDedupeKey(uvs));
 
-    const { duplicates } = splitDuplicates([riot], new Set([eventDedupeKey(uvs)]));
-    expect(duplicates).toHaveLength(1);
+    const { matched } = splitDuplicates([riot], buildDedupeIndex([uvs]));
+    expect(matched).toHaveLength(1);
   });
 
   it('still separates stores more than ~250m apart', () => {
     const a = { latitude: 37.0203, longitude: -121.5604, startDate: new Date('2026-10-02T01:00:00Z') };
     const b = { latitude: 37.0253, longitude: -121.5604, startDate: new Date('2026-10-02T01:00:00Z') };
-    const { unique, duplicates } = splitDuplicates([b], new Set([eventDedupeKey(a)]));
+    const { unique, matched } = splitDuplicates([b], buildDedupeIndex([a]));
     expect(unique).toHaveLength(1);
-    expect(duplicates).toHaveLength(0);
+    expect(matched).toHaveLength(0);
+  });
+});
+
+describe('price + category guard (looksLikeDifferentEvent)', () => {
+  // Real case from the audit: Games of Martinez, 2026-10-16T01:00Z. The store's
+  // stale recurring UVS series and its Riot prerelease start at the same minute
+  // at the same address, but they are two different events.
+  const gamesOfMartinezUvs = {
+    id: '778899',
+    latitude: 38.0194,
+    longitude: -122.1341,
+    startDate: new Date('2026-10-16T01:00:00Z'),
+    eventType: 'Nexus Night',
+    price: '$15.00',
+  };
+  const gamesOfMartinezRiot = {
+    id: 'prb-117096731805661097',
+    latitude: 38.0194,
+    longitude: -122.1341,
+    startDate: new Date('2026-10-16T01:00:00Z'),
+    eventType: 'Pre-Rift',
+    price: '$40.00',
+  };
+
+  it('rejects a match when price and category both differ', () => {
+    expect(eventDedupeKey(gamesOfMartinezRiot)).toBe(eventDedupeKey(gamesOfMartinezUvs));
+    expect(looksLikeDifferentEvent(gamesOfMartinezRiot, gamesOfMartinezUvs)).toBe(true);
+
+    const { unique, matched } = splitDuplicates([gamesOfMartinezRiot], buildDedupeIndex([gamesOfMartinezUvs]));
+    expect(matched).toHaveLength(0);
+    expect(unique.map(e => e.id)).toEqual(['prb-117096731805661097']);
+  });
+
+  it('still matches a true duplicate that agrees on price and category', () => {
+    const uvs = {
+      id: '112233',
+      latitude: 37.9419,
+      longitude: -121.7367,
+      startDate: new Date('2026-10-19T01:00:00Z'),
+      eventType: 'Pre-Rift',
+      price: '$40.00',
+    };
+    const riot = {
+      id: 'prb-117124556273536574',
+      latitude: 37.9419,
+      longitude: -121.7367,
+      startDate: new Date('2026-10-19T01:00:00Z'),
+      eventType: 'Pre-Rift',
+      price: '$40.00',
+    };
+    expect(looksLikeDifferentEvent(riot, uvs)).toBe(false);
+
+    const { unique, matched } = splitDuplicates([riot], buildDedupeIndex([uvs]));
+    expect(unique).toHaveLength(0);
+    expect(matched).toHaveLength(1);
+    expect(matched[0].primary.id).toBe('112233');
+  });
+
+  it('treats a differing price alone as the same event', () => {
+    const uvs = { ...gamesOfMartinezUvs, eventType: 'Pre-Rift' };
+    expect(looksLikeDifferentEvent(gamesOfMartinezRiot, uvs)).toBe(false);
+    expect(splitDuplicates([gamesOfMartinezRiot], buildDedupeIndex([uvs])).matched).toHaveLength(1);
+  });
+
+  it('treats a differing category alone as the same event', () => {
+    const uvs = { ...gamesOfMartinezUvs, price: '$40.00' };
+    expect(looksLikeDifferentEvent(gamesOfMartinezRiot, uvs)).toBe(false);
+    expect(splitDuplicates([gamesOfMartinezRiot], buildDedupeIndex([uvs])).matched).toHaveLength(1);
+  });
+
+  it('does not treat a null price or category as a difference', () => {
+    const riotNoPrice = { ...gamesOfMartinezRiot, price: null };
+    expect(looksLikeDifferentEvent(riotNoPrice, gamesOfMartinezUvs)).toBe(false);
+
+    const riotNoCategory = { ...gamesOfMartinezRiot, eventType: null };
+    expect(looksLikeDifferentEvent(riotNoCategory, gamesOfMartinezUvs)).toBe(false);
+
+    const uvsNothing = { ...gamesOfMartinezUvs, price: undefined, eventType: undefined };
+    expect(looksLikeDifferentEvent(gamesOfMartinezRiot, uvsNothing)).toBe(false);
+  });
+
+  it('treats equivalent spellings of free as the same price', () => {
+    const uvs = { ...gamesOfMartinezUvs, price: 'Free' };
+    const riot = { ...gamesOfMartinezRiot, price: 'Free Event' };
+    expect(looksLikeDifferentEvent(riot, uvs)).toBe(false);
+    expect(looksLikeDifferentEvent({ ...riot, price: '$0.00' }, uvs)).toBe(false);
+  });
+
+  it('picks the co-located UVS event that is actually the same event', () => {
+    // The store runs both at the same minute: the stale recurring series and the
+    // prerelease. Riot's Pre-Rift must merge into the UVS Pre-Rift, not the
+    // Nexus Night sitting in the same cell.
+    const index = buildDedupeIndex([gamesOfMartinezUvs]);
+    const uvsPreRift = { ...gamesOfMartinezUvs, id: '778900', eventType: 'Pre-Rift', price: '$40.00' };
+    addToDedupeIndex(index, uvsPreRift);
+
+    expect(findDuplicate(gamesOfMartinezRiot, index)?.id).toBe('778900');
+  });
+});
+
+describe('markEventSeen', () => {
+  // UVS offset pagination is unstable: the audit counted 607 repeated event ids
+  // across 40,433 rows in one run (1.5%), which used to be upserted twice.
+  it('reports the first sighting and skips repeats within a run', () => {
+    const seen = new Set<string>();
+    expect(markEventSeen(seen, '1039321')).toBe(true);
+    expect(markEventSeen(seen, '1039321')).toBe(false);
+    expect(markEventSeen(seen, '1039322')).toBe(true);
+    expect(seen.size).toBe(2);
+  });
+
+  it('counts how many upserts a run avoids', () => {
+    const seen = new Set<string>();
+    const pages = [['1', '2', '3'], ['3', '4', '1'], ['5']];
+    let processed = 0;
+    let duplicateIds = 0;
+
+    for (const page of pages) {
+      for (const id of page) {
+        if (!markEventSeen(seen, id)) {
+          duplicateIds++;
+          continue;
+        }
+        processed++;
+      }
+    }
+
+    expect(processed).toBe(5);
+    expect(duplicateIds).toBe(2);
+  });
+});
+
+describe('one primary per secondary', () => {
+  // A store can run two Riot tournaments at the same minute. They must not both
+  // collapse onto the same UVS row - the second one is a separate event.
+  const uvs = {
+    id: '990011',
+    latitude: 37.9419,
+    longitude: -121.7367,
+    startDate: new Date('2026-10-19T01:00:00Z'),
+    eventType: 'Pre-Rift',
+    price: '$40.00',
+  };
+  const riotA = { ...uvs, id: 'prb-117096731805661097' };
+  const riotB = { ...uvs, id: 'prb-117124556273536574' };
+
+  it('merges the first and inserts the second', () => {
+    const { unique, matched } = splitDuplicates([riotA, riotB], buildDedupeIndex([uvs]));
+    expect(matched.map(m => m.secondary.id)).toEqual(['prb-117096731805661097']);
+    expect(unique.map(e => e.id)).toEqual(['prb-117124556273536574']);
+  });
+
+  it('matches each Riot event to its own UVS event when the store has two', () => {
+    const secondUvs = { ...uvs, id: '990012' };
+    const { unique, matched } = splitDuplicates([riotA, riotB], buildDedupeIndex([uvs, secondUvs]));
+    expect(unique).toHaveLength(0);
+    expect(matched.map(m => m.primary.id)).toEqual(['990011', '990012']);
   });
 });

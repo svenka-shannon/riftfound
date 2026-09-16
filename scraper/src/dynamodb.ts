@@ -116,6 +116,8 @@ interface DynamoEventItem {
   price: string | null;
   url: string | null;
   imageUrl: string | null;
+  /** Contributing source(s): ['uvs'], ['playriftbound'] or both when field-merged. */
+  sources: string[] | null;
   shopId: number | null;
   shopExternalId: number | null;
   shopName: string | null;
@@ -183,6 +185,7 @@ function hasEventChanged(existing: DynamoEventItem, newItem: DynamoEventItem): b
     existing.capacity !== newItem.capacity ||
     existing.price !== newItem.price ||
     existing.url !== newItem.url ||
+    (existing.sources ?? []).join(',') !== (newItem.sources ?? []).join(',') ||
     existing.shopId !== newItem.shopId ||
     existing.shopName !== newItem.shopName ||
     existing.shopLatitude !== newItem.shopLatitude ||
@@ -443,6 +446,7 @@ export async function upsertEventWithStoreDynamoDB(
     price: event.price ?? null,
     url: event.url ?? null,
     imageUrl: event.imageUrl ?? null,
+    sources: event.sources?.length ? event.sources : null,
     shopId: storeInfo?.id ?? null,
     shopExternalId: storeInfo?.id ?? null,
     shopName: storeInfo?.name ?? null,

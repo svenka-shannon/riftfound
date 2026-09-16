@@ -13,7 +13,9 @@ src/
 ├── lambda.ts                   # Lambda entry point (burst mode), also runs both sources
 ├── config.ts                   # Zod-validated env config
 ├── database.ts                 # DB operations for events, shops, scrape_runs
-├── dedupe.ts                   # Cross-source de-duplication key
+├── dedupe.ts                   # Cross-source de-duplication key + match guard
+├── merge.ts                    # Field-merge policy for matched cross-source pairs
+├── sanitize.ts                 # Free-text sanitisation for everything written to the DB
 ├── api.ts                      # UVS Games API client (source 1)
 └── sources/playriftbound.ts    # Riot playriftbound API client (source 2)
 ```
@@ -26,6 +28,12 @@ The scraper uses the UVS Games API with a **distributed scraping** approach:
 2. **Distributed fetching**: Spreads ~31 page requests evenly across the 60-minute cycle (~105s between requests)
 3. **Upsert events** (`database.ts`): Inserts/updates events with coordinates from API
 4. **Upsert stores**: Store info (with coordinates) embedded in each event response
+
+The API's offset pagination is not stable across a run: a measured 607 of 40,433
+rows (1.5%) were the *same* event id returned on more than one page. Every run
+therefore tracks the ids it has already handled (`eventIdsSeen` +
+`markEventSeen`) and skips repeats instead of upserting them twice; the count is
+reported in the run summary (`Duplicate event ids skipped`).
 
 This approach prevents burst traffic and maintains consistent, gentle load on the upstream API.
 
@@ -140,16 +148,63 @@ round(latitude, 3) | round(longitude, 3) | start time truncated to the minute
 3 decimal places is ~110m: tight enough to keep neighbouring stores apart, loose
 enough to absorb the two APIs' different geocoders. Lookups also check the eight
 neighbouring cells, because a store the two APIs geocode ~20m apart can still
-land either side of a rounding boundary. Measured on ~700 UVS and ~430
-playriftbound events around San Francisco, that lifts duplicate detection from 42
-to 50 of the 50 true duplicates, while **no** two different stores in the sample
-ran events within 250m of each other at the same minute - so the wider match does
-not swallow distinct events.
+land either side of a rounding boundary. Measured against the live feeds in the
+Bay Area, where 42 events matched, the neighbour-cell lookup reaches **98.5%
+recall on provable duplicates**; the 6 remaining misses are geocode drift wider
+than one cell, not different events.
 
-The key set is built during the UVS pass only; colliding playriftbound events are
-skipped and counted. playriftbound events are never de-duplicated against each
-other - one store legitimately runs two different tournaments at the same minute,
-and Riot's tournament ids already keep those apart.
+### The price + category guard
+
+Location + time alone over-merges. Of 391 pairs that matched on location and time
+across the whole feed, **192 were not the same event**: overwhelmingly a store's
+stale recurring UVS series sitting on top of that same store's Riot prerelease.
+Concrete case - Games of Martinez, 2026-10-16T01:00Z: UVS "Thursday Nexus Nights"
+($15, Nexus Night) against Riot "Radiance Pre-Rift Event" ($40, Pre-Rift).
+
+The audit found a clean discriminator:
+
+| | price agrees |
+|---|---|
+| sources agree on category | **86.9%** |
+| sources disagree on category | **3.6%** |
+
+So `looksLikeDifferentEvent` **rejects a candidate match when price *and*
+category both differ**, and the two records are kept as two separate events. A
+null/missing price or category on either side is *not* a difference - only two
+present, conflicting values count. "Free", "Free Event" and "$0.00" are treated
+as the same price.
+
+Because a store can have several events in one cell at one minute, the index maps
+a key to a *list* of UVS events and the guard picks which of them (if any) the
+Riot event actually is.
+
+### Merging matched pairs
+
+A match is **not** a reason to throw a record away. The UVS record stays the row
+of record (same `external_id`, so no duplicate row is created) and Riot's fields
+are merged onto it (`src/merge.ts`):
+
+| field | winner | why |
+|---|---|---|
+| `eventType` | **Riot** | real `tournamentType` enum vs UVS name-regex inference (82.8% accurate, ~27% wrong outside prerelease week). Riot's generic `Other` does not overwrite a specific UVS category. |
+| `url` | **Riot** | UVS is null on every row; Riot has one on 100% |
+| `playerCount` | **UVS** | Riot returns an empty `registrantCounts` for ~70% of events, so its count is null 72% of the time. Riot only fills a UVS null. |
+| `description`, `imageUrl`, `endDate` | **UVS** | Riot's search API exposes none of the three |
+| `capacity`, `price` | **UVS** unless null | incumbent value; avoids rewriting rows every run |
+| `name`, `organizer`, `location`, address, coords, `startDate`, store | **UVS** | incumbent; churning them rewrites the whole table for no visible gain |
+
+The merged row records its origin in a `sources` field (`uvs`,
+`uvs,playriftbound`) - a column on SQLite, an attribute on DynamoDB - so where a
+row came from is inspectable rather than guessable.
+
+A UVS row can only absorb **one** Riot record per run: if a store runs two Riot
+tournaments at the same minute and the same place, the first merges into the
+matching UVS row and the second is inserted as its own event.
+
+The index is built during the UVS pass only. playriftbound events are never
+de-duplicated against each other - one store legitimately runs two different
+tournaments at the same minute, and Riot's tournament ids already keep those
+apart.
 
 playriftbound events are stored with a `prb-` prefix on `external_id` so they can
 never collide with UVS numeric ids, and their organizers are stored as shops with
@@ -160,6 +215,27 @@ Because anchors are swept in rotating batches, a playriftbound event missing fro
 one run's "seen" set is expected rather than cancelled, so `prb-` events are
 always excluded from the daily stale-event cleanup and are aged out by
 `deleteOldEvents` / the DynamoDB TTL instead.
+
+## Sanitisation
+
+Both feeds are user-editable (store owners type their own event names, organizer
+names and descriptions) and both used to be written to the DB verbatim. Riot's
+live API currently returns 11 events whose `organizer.name` ends in
+`<script src="https://…/jquery.js?v=2"></script>` - a stored-XSS payload in
+production data.
+
+`src/sanitize.ts` strips (never escapes) markup from every free-text field that
+reaches the DB - `name`, `description`, `organizer`, `location`, `address`,
+`city`, `state`, `country` and the store/shop name - for **both** sources:
+
+1. script/style/iframe/object/embed/svg elements are removed *with their contents*
+2. remaining tags are removed repeatedly, so `<scr<b>ipt>` cannot re-form
+3. leftover angle brackets and control characters are dropped
+4. whitespace is collapsed and the value trimmed
+
+Records are cleaned and **kept**, never dropped. It is applied at the two source
+converters *and* at the `upsertEventWithStore` / `upsertShopFromApi` boundary, so
+no future code path can write raw text to a table.
 
 ## Environment
 
